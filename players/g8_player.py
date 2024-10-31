@@ -129,7 +129,7 @@ class G8_Player:
 
             for _, current_points, uuid in beam:
                 next_points = self.generate_next_points(current_points[-1])
-
+                print(len(next_points))
                 for next_point in next_points:
                     if len(current_points) > 1:
                         if not self.is_valid_cut(
@@ -156,6 +156,8 @@ class G8_Player:
 
             # Keep best beam_width solutions
             beam = sorted(new_beam, key=lambda x: x[0])[:beam_width]
+            
+            
 
         if best_solution is None:
             raise ValueError("No valid solution found")
