@@ -23,6 +23,7 @@ if __name__ == '__main__':
         if args.log_path == "log":
             args.log_path = "results.log"
 
-    root = tk.Tk()
+    # root = tk.Tk()
+    root = None
     app = PieceOfCakeGame(args, root)
 

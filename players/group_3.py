@@ -101,3 +101,14 @@ class Player:
             else:
                 self.preplanned_moves.append([cake_width, cake_len - 0.01])
         self.preplanned_moves.append([target_pos[0], target_pos[1]])
+
+
+
+center_x, center_y = find_center(image)
+masked_images = []
+num_samples = 0
+while num_samples < NUM_TIMES_TO_MASK_IMAGE:
+    mask_x_start, mask_y_start = get_mask_start_coords(num_samples, center_x, center_y)
+    new_image = mask_image(image, mask_x_start, mask_y_start, MASK_HEIGHT, MASK_WIDTH)
+    masked_images.append(new_image)
+    num_samples += 1

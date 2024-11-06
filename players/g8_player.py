@@ -15,7 +15,7 @@ import miniball
 
 import constants
 from piece_of_cake_state import PieceOfCakeState
-from g8_cuda import polygon_line_intersection
+# from g8_cuda import polygon_line_intersection
 
 
 class G8_Player:
@@ -132,7 +132,7 @@ class G8_Player:
 
             for _, current_points, uuid in beam:
                 next_points = self.generate_next_points(current_points[-1])
-                print(len(next_points))
+                # print(len(next_points))
                 for next_point in next_points:
                     if len(current_points) > 1:
                         if not self.is_valid_cut(
@@ -164,8 +164,8 @@ class G8_Player:
 
         if best_solution is None:
             raise ValueError("No valid solution found")
-        print(f"Correct CUDA intersections: {self.correct_cuda_intersections}")
-        print(f"Incorrect CUDA intersections: {self.incorrect_cuda_intersections}")
+        # print(f"Correct CUDA intersections: {self.correct_cuda_intersections}")
+        # print(f"Incorrect CUDA intersections: {self.incorrect_cuda_intersections}")
         return best_solution
 
     def evaluate_cut_sequence(
@@ -186,20 +186,20 @@ class G8_Player:
 
         new_pieces = []
         for piece in pieces:
-            # Convert piece (Shapely polygon) to array format for the GPU
-            piece_coords = np.array(piece.exterior.coords)  # Extract polygon coordinates
+            # # Convert piece (Shapely polygon) to array format for the GPU
+            # piece_coords = np.array(piece.exterior.coords)  # Extract polygon coordinates
 
-            # Run the GPU kernel to check for intersections
-            intersections = polygon_line_intersection(piece_coords, line_coords)
+            # # Run the GPU kernel to check for intersections
+            # intersections = polygon_line_intersection(piece_coords, line_coords)
             
-            cuda_intersection = intersections.sum() > 0
-            normal_intersection = cut.intersects(piece)
-            if cuda_intersection == normal_intersection:
-                print("Same")
-                self.correct_cuda_intersections += 1
-            else: 
-                print("NO")
-                self.incorrect_cuda_intersections += 1
+            # cuda_intersection = intersections.sum() > 0
+            # normal_intersection = cut.intersects(piece)
+            # if cuda_intersection == normal_intersection:
+            #     print("Same")
+            #     self.correct_cuda_intersections += 1
+            # else: 
+            #     print("NO")
+            #     self.incorrect_cuda_intersections += 1
                 
             if cut.intersects(piece):
                 split_result = split(piece, cut)

@@ -1,0 +1,415 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="330" onload="init(evt)" viewBox="0 0 1200 330" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:"Verdana"; font-size:12px; fill:rgb(0,0,0); }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = true;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            var el = frames.children;
+            for(var i = 0; i < el.length; i++) {
+                update_text(el[i]);
+            }
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+            if (!isEdge) {
+                svg.removeAttribute("viewBox");
+            }
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (/^ *\$/.test(txt) || t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                update_text(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                update_text(e);
+            }
+        }
+    }
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+        update_text(el[i]);
+    }
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="330" fill="url(#background)"/><text id="title" x="50.0000%" y="24.00">py-spy record -p 1 --output /app/flamegraph.svg --rate 1000</text><text id="details" x="10" y="40.00"> </text><text id="unzoom" class="hide" x="10" y="24.00">Reset Zoom</text><text id="search" x="1190" y="24.00">Search</text><text id="matched" x="1190" y="319.00"> </text><svg id="frames" x="10" width="1180" total_samples="23001"><g><title>wrapped (shapely/decorators.py:77) (37 samples, 0.16%)</title><rect x="0.1956%" y="196" width="0.1609%" height="15" fill="rgb(227,0,7)" fg:x="45" fg:w="37"/><text x="0.4456%" y="206.50"></text></g><g><title>linestrings (shapely/creation.py:119) (34 samples, 0.15%)</title><rect x="0.2087%" y="212" width="0.1478%" height="15" fill="rgb(217,0,24)" fg:x="48" fg:w="34"/><text x="0.4587%" y="222.50"></text></g><g><title>__new__ (shapely/geometry/linestring.py:73) (51 samples, 0.22%)</title><rect x="0.1435%" y="180" width="0.2217%" height="15" fill="rgb(221,193,54)" fg:x="33" fg:w="51"/><text x="0.3935%" y="190.50"></text></g><g><title>is_valid_cut (g8_player.py:396) (70 samples, 0.30%)</title><rect x="0.0652%" y="164" width="0.3043%" height="15" fill="rgb(248,212,6)" fg:x="15" fg:w="70"/><text x="0.3152%" y="174.50"></text></g><g><title>__new__ (shapely/geometry/point.py:67) (35 samples, 0.15%)</title><rect x="0.6608%" y="180" width="0.1522%" height="15" fill="rgb(208,68,35)" fg:x="152" fg:w="35"/><text x="0.9108%" y="190.50"></text></g><g><title>issubdtype (numpy/_core/numerictypes.py:529) (38 samples, 0.17%)</title><rect x="0.8695%" y="196" width="0.1652%" height="15" fill="rgb(232,128,0)" fg:x="200" fg:w="38"/><text x="1.1195%" y="206.50"></text></g><g><title>__new__ (shapely/geometry/point.py:76) (63 samples, 0.27%)</title><rect x="0.8304%" y="180" width="0.2739%" height="15" fill="rgb(207,160,47)" fg:x="191" fg:w="63"/><text x="1.0804%" y="190.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (30 samples, 0.13%)</title><rect x="1.1304%" y="196" width="0.1304%" height="15" fill="rgb(228,23,34)" fg:x="260" fg:w="30"/><text x="1.3804%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (147 samples, 0.64%)</title><rect x="1.3478%" y="196" width="0.6391%" height="15" fill="rgb(218,30,26)" fg:x="310" fg:w="147"/><text x="1.5978%" y="206.50"></text></g><g><title>points (shapely/creation.py:74) (134 samples, 0.58%)</title><rect x="1.4043%" y="212" width="0.5826%" height="15" fill="rgb(220,122,19)" fg:x="323" fg:w="134"/><text x="1.6543%" y="222.50"></text></g><g><title>__new__ (shapely/geometry/point.py:78) (212 samples, 0.92%)</title><rect x="1.1086%" y="180" width="0.9217%" height="15" fill="rgb(250,228,42)" fg:x="255" fg:w="212"/><text x="1.3586%" y="190.50"></text></g><g><title>_maybe_unpack (shapely/geometry/base.py:72) (30 samples, 0.13%)</title><rect x="2.1347%" y="196" width="0.1304%" height="15" fill="rgb(240,193,28)" fg:x="491" fg:w="30"/><text x="2.3847%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (27 samples, 0.12%)</title><rect x="2.2825%" y="196" width="0.1174%" height="15" fill="rgb(216,20,37)" fg:x="525" fg:w="27"/><text x="2.5325%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (450 samples, 1.96%)</title><rect x="2.5129%" y="196" width="1.9564%" height="15" fill="rgb(206,188,39)" fg:x="578" fg:w="450"/><text x="2.7629%" y="206.50">w..</text></g><g><title>distance (shapely/measurement.py:72) (442 samples, 1.92%)</title><rect x="2.5477%" y="212" width="1.9217%" height="15" fill="rgb(217,207,13)" fg:x="586" fg:w="442"/><text x="2.7977%" y="222.50">d..</text></g><g><title>solve (g8_player.py:138) (1,026 samples, 4.46%)</title><rect x="0.0522%" y="148" width="4.4607%" height="15" fill="rgb(231,73,38)" fg:x="12" fg:w="1026"/><text x="0.3022%" y="158.50">solve..</text></g><g><title>is_valid_cut (g8_player.py:400) (936 samples, 4.07%)</title><rect x="0.4435%" y="164" width="4.0694%" height="15" fill="rgb(225,20,46)" fg:x="102" fg:w="936"/><text x="0.6935%" y="174.50">is_v..</text></g><g><title>distance (shapely/geometry/base.py:334) (569 samples, 2.47%)</title><rect x="2.0390%" y="180" width="2.4738%" height="15" fill="rgb(210,31,41)" fg:x="469" fg:w="569"/><text x="2.2890%" y="190.50">di..</text></g><g><title>__new__ (shapely/geometry/linestring.py:66) (70 samples, 0.30%)</title><rect x="4.9215%" y="180" width="0.3043%" height="15" fill="rgb(221,200,47)" fg:x="1132" fg:w="70"/><text x="5.1715%" y="190.50"></text></g><g><title>&lt;listcomp&gt; (shapely/geometry/linestring.py:66) (59 samples, 0.26%)</title><rect x="4.9693%" y="196" width="0.2565%" height="15" fill="rgb(226,26,5)" fg:x="1143" fg:w="59"/><text x="5.2193%" y="206.50"></text></g><g><title>_coords (shapely/geometry/linestring.py:64) (48 samples, 0.21%)</title><rect x="5.0172%" y="212" width="0.2087%" height="15" fill="rgb(249,33,26)" fg:x="1154" fg:w="48"/><text x="5.2672%" y="222.50"></text></g><g><title>&lt;listcomp&gt; (shapely/geometry/linestring.py:64) (26 samples, 0.11%)</title><rect x="5.1128%" y="228" width="0.1130%" height="15" fill="rgb(235,183,28)" fg:x="1176" fg:w="26"/><text x="5.3628%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (214 samples, 0.93%)</title><rect x="5.5172%" y="196" width="0.9304%" height="15" fill="rgb(221,5,38)" fg:x="1269" fg:w="214"/><text x="5.7672%" y="206.50"></text></g><g><title>linestrings (shapely/creation.py:119) (202 samples, 0.88%)</title><rect x="5.5693%" y="212" width="0.8782%" height="15" fill="rgb(247,18,42)" fg:x="1281" fg:w="202"/><text x="5.8193%" y="222.50"></text></g><g><title>evaluate_cut_sequence (g8_player.py:178) (409 samples, 1.78%)</title><rect x="4.7476%" y="164" width="1.7782%" height="15" fill="rgb(241,131,45)" fg:x="1092" fg:w="409"/><text x="4.9976%" y="174.50">e..</text></g><g><title>__new__ (shapely/geometry/linestring.py:73) (295 samples, 1.28%)</title><rect x="5.2433%" y="180" width="1.2826%" height="15" fill="rgb(249,31,29)" fg:x="1206" fg:w="295"/><text x="5.4933%" y="190.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (24 samples, 0.10%)</title><rect x="6.7345%" y="212" width="0.1043%" height="15" fill="rgb(225,111,53)" fg:x="1549" fg:w="24"/><text x="6.9845%" y="222.50"></text></g><g><title>coords (shapely/geometry/base.py:223) (50 samples, 0.22%)</title><rect x="6.6388%" y="180" width="0.2174%" height="15" fill="rgb(238,160,17)" fg:x="1527" fg:w="50"/><text x="6.8888%" y="190.50"></text></g><g><title>has_z (shapely/geometry/base.py:624) (29 samples, 0.13%)</title><rect x="6.7301%" y="196" width="0.1261%" height="15" fill="rgb(214,148,48)" fg:x="1548" fg:w="29"/><text x="6.9801%" y="206.50"></text></g><g><title>evaluate_cut_sequence (g8_player.py:184) (68 samples, 0.30%)</title><rect x="6.5693%" y="164" width="0.2956%" height="15" fill="rgb(232,36,49)" fg:x="1511" fg:w="68"/><text x="6.8193%" y="174.50"></text></g><g><title>_maybe_unpack (shapely/geometry/base.py:72) (93 samples, 0.40%)</title><rect x="7.2562%" y="196" width="0.4043%" height="15" fill="rgb(209,103,24)" fg:x="1669" fg:w="93"/><text x="7.5062%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (68 samples, 0.30%)</title><rect x="7.6736%" y="196" width="0.2956%" height="15" fill="rgb(229,88,8)" fg:x="1765" fg:w="68"/><text x="7.9236%" y="206.50"></text></g><g><title>&lt;listcomp&gt; (shapely/decorators.py:65) (38 samples, 0.17%)</title><rect x="7.8040%" y="212" width="0.1652%" height="15" fill="rgb(213,181,19)" fg:x="1795" fg:w="38"/><text x="8.0540%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:66) (47 samples, 0.20%)</title><rect x="8.0127%" y="196" width="0.2043%" height="15" fill="rgb(254,191,54)" fg:x="1843" fg:w="47"/><text x="8.2627%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:73) (35 samples, 0.15%)</title><rect x="8.2692%" y="196" width="0.1522%" height="15" fill="rgb(241,83,37)" fg:x="1902" fg:w="35"/><text x="8.5192%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (1,923 samples, 8.36%)</title><rect x="8.4562%" y="196" width="8.3605%" height="15" fill="rgb(233,36,39)" fg:x="1945" fg:w="1923"/><text x="8.7062%" y="206.50">wrapped (sha..</text></g><g><title>intersects (shapely/predicates.py:778) (1,905 samples, 8.28%)</title><rect x="8.5344%" y="212" width="8.2822%" height="15" fill="rgb(226,3,54)" fg:x="1963" fg:w="1905"/><text x="8.7844%" y="222.50">intersects (..</text></g><g><title>evaluate_cut_sequence (g8_player.py:204) (2,332 samples, 10.14%)</title><rect x="6.8954%" y="164" width="10.1387%" height="15" fill="rgb(245,192,40)" fg:x="1586" fg:w="2332"/><text x="7.1454%" y="174.50">evaluate_cut_se..</text></g><g><title>intersects (shapely/geometry/base.py:719) (2,318 samples, 10.08%)</title><rect x="6.9562%" y="180" width="10.0778%" height="15" fill="rgb(238,167,29)" fg:x="1600" fg:w="2318"/><text x="7.2062%" y="190.50">intersects (sha..</text></g><g><title>wrapped (shapely/decorators.py:79) (50 samples, 0.22%)</title><rect x="16.8167%" y="196" width="0.2174%" height="15" fill="rgb(232,182,51)" fg:x="3868" fg:w="50"/><text x="17.0667%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (169 samples, 0.73%)</title><rect x="17.5818%" y="212" width="0.7348%" height="15" fill="rgb(231,60,39)" fg:x="4044" fg:w="169"/><text x="17.8318%" y="222.50"></text></g><g><title>get_type_id (shapely/_geometry.py:86) (168 samples, 0.73%)</title><rect x="17.5862%" y="228" width="0.7304%" height="15" fill="rgb(208,69,12)" fg:x="4045" fg:w="168"/><text x="17.8362%" y="238.50"></text></g><g><title>split (shapely/ops.py:509) (266 samples, 1.16%)</title><rect x="17.1906%" y="180" width="1.1565%" height="15" fill="rgb(235,93,37)" fg:x="3954" fg:w="266"/><text x="17.4406%" y="190.50"></text></g><g><title>geom_type (shapely/geometry/base.py:322) (236 samples, 1.03%)</title><rect x="17.3210%" y="196" width="1.0260%" height="15" fill="rgb(213,116,39)" fg:x="3984" fg:w="236"/><text x="17.5710%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (146 samples, 0.63%)</title><rect x="18.5470%" y="212" width="0.6348%" height="15" fill="rgb(222,207,29)" fg:x="4266" fg:w="146"/><text x="18.7970%" y="222.50"></text></g><g><title>get_type_id (shapely/_geometry.py:86) (145 samples, 0.63%)</title><rect x="18.5514%" y="228" width="0.6304%" height="15" fill="rgb(206,96,30)" fg:x="4267" fg:w="145"/><text x="18.8014%" y="238.50"></text></g><g><title>split (shapely/ops.py:514) (202 samples, 0.88%)</title><rect x="18.3470%" y="180" width="0.8782%" height="15" fill="rgb(218,138,4)" fg:x="4220" fg:w="202"/><text x="18.5970%" y="190.50"></text></g><g><title>geom_type (shapely/geometry/base.py:322) (190 samples, 0.83%)</title><rect x="18.3992%" y="196" width="0.8261%" height="15" fill="rgb(250,191,14)" fg:x="4232" fg:w="190"/><text x="18.6492%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (111 samples, 0.48%)</title><rect x="19.3861%" y="212" width="0.4826%" height="15" fill="rgb(239,60,40)" fg:x="4459" fg:w="111"/><text x="19.6361%" y="222.50"></text></g><g><title>get_type_id (shapely/_geometry.py:86) (107 samples, 0.47%)</title><rect x="19.4035%" y="228" width="0.4652%" height="15" fill="rgb(206,27,48)" fg:x="4463" fg:w="107"/><text x="19.6535%" y="238.50"></text></g><g><title>split (shapely/ops.py:531) (159 samples, 0.69%)</title><rect x="19.2253%" y="180" width="0.6913%" height="15" fill="rgb(225,35,8)" fg:x="4422" fg:w="159"/><text x="19.4753%" y="190.50"></text></g><g><title>geom_type (shapely/geometry/base.py:322) (155 samples, 0.67%)</title><rect x="19.2426%" y="196" width="0.6739%" height="15" fill="rgb(250,213,24)" fg:x="4426" fg:w="155"/><text x="19.4926%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (114 samples, 0.50%)</title><rect x="20.0687%" y="212" width="0.4956%" height="15" fill="rgb(247,123,22)" fg:x="4616" fg:w="114"/><text x="20.3187%" y="222.50"></text></g><g><title>get_type_id (shapely/_geometry.py:86) (112 samples, 0.49%)</title><rect x="20.0774%" y="228" width="0.4869%" height="15" fill="rgb(231,138,38)" fg:x="4618" fg:w="112"/><text x="20.3274%" y="238.50"></text></g><g><title>split (shapely/ops.py:532) (163 samples, 0.71%)</title><rect x="19.9165%" y="180" width="0.7087%" height="15" fill="rgb(231,145,46)" fg:x="4581" fg:w="163"/><text x="20.1665%" y="190.50"></text></g><g><title>geom_type (shapely/geometry/base.py:322) (158 samples, 0.69%)</title><rect x="19.9383%" y="196" width="0.6869%" height="15" fill="rgb(251,118,11)" fg:x="4586" fg:w="158"/><text x="20.1883%" y="206.50"></text></g><g><title>geometrycollections (shapely/creation.py:458) (32 samples, 0.14%)</title><rect x="21.1252%" y="228" width="0.1391%" height="15" fill="rgb(217,147,25)" fg:x="4859" fg:w="32"/><text x="21.3752%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (355 samples, 1.54%)</title><rect x="21.0860%" y="212" width="1.5434%" height="15" fill="rgb(247,81,37)" fg:x="4850" fg:w="355"/><text x="21.3360%" y="222.50"></text></g><g><title>geometrycollections (shapely/creation.py:460) (314 samples, 1.37%)</title><rect x="21.2643%" y="228" width="1.3652%" height="15" fill="rgb(209,12,38)" fg:x="4891" fg:w="314"/><text x="21.5143%" y="238.50"></text></g><g><title>__new__ (shapely/geometry/collection.py:48) (405 samples, 1.76%)</title><rect x="20.9208%" y="196" width="1.7608%" height="15" fill="rgb(227,1,9)" fg:x="4812" fg:w="405"/><text x="21.1708%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (155 samples, 0.67%)</title><rect x="23.0990%" y="228" width="0.6739%" height="15" fill="rgb(248,47,43)" fg:x="5313" fg:w="155"/><text x="23.3490%" y="238.50"></text></g><g><title>boundary (shapely/constructive.py:82) (149 samples, 0.65%)</title><rect x="23.1251%" y="244" width="0.6478%" height="15" fill="rgb(221,10,30)" fg:x="5319" fg:w="149"/><text x="23.3751%" y="254.50"></text></g><g><title>boundary (shapely/geometry/base.py:361) (209 samples, 0.91%)</title><rect x="22.8816%" y="212" width="0.9087%" height="15" fill="rgb(210,229,1)" fg:x="5263" fg:w="209"/><text x="23.1316%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (1,034 samples, 4.50%)</title><rect x="24.1120%" y="228" width="4.4955%" height="15" fill="rgb(222,148,37)" fg:x="5546" fg:w="1034"/><text x="24.3620%" y="238.50">wrapp..</text></g><g><title>union (shapely/set_operations.py:334) (1,018 samples, 4.43%)</title><rect x="24.1816%" y="244" width="4.4259%" height="15" fill="rgb(234,67,33)" fg:x="5562" fg:w="1018"/><text x="24.4316%" y="254.50">union..</text></g><g><title>_split_polygon_with_line (shapely/ops.py:370) (1,358 samples, 5.90%)</title><rect x="22.7599%" y="196" width="5.9041%" height="15" fill="rgb(247,98,35)" fg:x="5235" fg:w="1358"/><text x="23.0099%" y="206.50">_split_p..</text></g><g><title>union (shapely/geometry/base.py:615) (1,119 samples, 4.87%)</title><rect x="23.7990%" y="212" width="4.8650%" height="15" fill="rgb(247,138,52)" fg:x="5474" fg:w="1119"/><text x="24.0490%" y="222.50">union ..</text></g><g><title>__init__ (shapely/prepared.py:26) (161 samples, 0.70%)</title><rect x="28.8379%" y="228" width="0.7000%" height="15" fill="rgb(213,79,30)" fg:x="6633" fg:w="161"/><text x="29.0879%" y="238.50"></text></g><g><title>prepare (shapely/creation.py:501) (153 samples, 0.67%)</title><rect x="28.8727%" y="244" width="0.6652%" height="15" fill="rgb(246,177,23)" fg:x="6641" fg:w="153"/><text x="29.1227%" y="254.50"></text></g><g><title>_split_polygon_with_line (shapely/ops.py:375) (202 samples, 0.88%)</title><rect x="28.6640%" y="196" width="0.8782%" height="15" fill="rgb(230,62,27)" fg:x="6593" fg:w="202"/><text x="28.9140%" y="206.50"></text></g><g><title>prep (shapely/prepared.py:77) (195 samples, 0.85%)</title><rect x="28.6944%" y="212" width="0.8478%" height="15" fill="rgb(216,154,8)" fg:x="6600" fg:w="195"/><text x="28.9444%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (135 samples, 0.59%)</title><rect x="29.9335%" y="260" width="0.5869%" height="15" fill="rgb(244,35,45)" fg:x="6885" fg:w="135"/><text x="30.1835%" y="270.50"></text></g><g><title>get_num_geometries (shapely/_geometry.py:679) (132 samples, 0.57%)</title><rect x="29.9465%" y="276" width="0.5739%" height="15" fill="rgb(251,115,12)" fg:x="6888" fg:w="132"/><text x="30.1965%" y="286.50"></text></g><g><title>__iter__ (shapely/geometry/base.py:987) (198 samples, 0.86%)</title><rect x="29.6900%" y="228" width="0.8608%" height="15" fill="rgb(240,54,50)" fg:x="6829" fg:w="198"/><text x="29.9400%" y="238.50"></text></g><g><title>__len__ (shapely/geometry/base.py:991) (186 samples, 0.81%)</title><rect x="29.7422%" y="244" width="0.8087%" height="15" fill="rgb(233,84,52)" fg:x="6841" fg:w="186"/><text x="29.9922%" y="254.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (32 samples, 0.14%)</title><rect x="30.6248%" y="260" width="0.1391%" height="15" fill="rgb(207,117,47)" fg:x="7044" fg:w="32"/><text x="30.8748%" y="270.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (304 samples, 1.32%)</title><rect x="30.9117%" y="260" width="1.3217%" height="15" fill="rgb(249,43,39)" fg:x="7110" fg:w="304"/><text x="31.1617%" y="270.50"></text></g><g><title>get_geometry (shapely/_geometry.py:542) (298 samples, 1.30%)</title><rect x="30.9378%" y="276" width="1.2956%" height="15" fill="rgb(209,38,44)" fg:x="7116" fg:w="298"/><text x="31.1878%" y="286.50"></text></g><g><title>&lt;listcomp&gt; (shapely/ops.py:380) (621 samples, 2.70%)</title><rect x="29.5944%" y="212" width="2.6999%" height="15" fill="rgb(236,212,23)" fg:x="6807" fg:w="621"/><text x="29.8444%" y="222.50">&lt;l..</text></g><g><title>__iter__ (shapely/geometry/base.py:988) (401 samples, 1.74%)</title><rect x="30.5508%" y="228" width="1.7434%" height="15" fill="rgb(242,79,21)" fg:x="7027" fg:w="401"/><text x="30.8008%" y="238.50"></text></g><g><title>_get_geom_item (shapely/geometry/base.py:984) (397 samples, 1.73%)</title><rect x="30.5682%" y="244" width="1.7260%" height="15" fill="rgb(211,96,35)" fg:x="7031" fg:w="397"/><text x="30.8182%" y="254.50"></text></g><g><title>_maybe_unpack (shapely/geometry/base.py:72) (69 samples, 0.30%)</title><rect x="32.5899%" y="260" width="0.3000%" height="15" fill="rgb(253,215,40)" fg:x="7496" fg:w="69"/><text x="32.8399%" y="270.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (30 samples, 0.13%)</title><rect x="32.9116%" y="260" width="0.1304%" height="15" fill="rgb(211,81,21)" fg:x="7570" fg:w="30"/><text x="33.1616%" y="270.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (463 samples, 2.01%)</title><rect x="33.2203%" y="260" width="2.0130%" height="15" fill="rgb(208,190,38)" fg:x="7641" fg:w="463"/><text x="33.4703%" y="270.50">w..</text></g><g><title>contains (shapely/predicates.py:526) (452 samples, 1.97%)</title><rect x="33.2681%" y="276" width="1.9651%" height="15" fill="rgb(235,213,38)" fg:x="7652" fg:w="452"/><text x="33.5181%" y="286.50">c..</text></g><g><title>contains (shapely/prepared.py:32) (660 samples, 2.87%)</title><rect x="32.4203%" y="228" width="2.8694%" height="15" fill="rgb(237,122,38)" fg:x="7457" fg:w="660"/><text x="32.6703%" y="238.50">co..</text></g><g><title>contains (shapely/geometry/base.py:675) (649 samples, 2.82%)</title><rect x="32.4682%" y="244" width="2.8216%" height="15" fill="rgb(244,218,35)" fg:x="7468" fg:w="649"/><text x="32.7182%" y="254.50">co..</text></g><g><title>wrapped (shapely/decorators.py:64) (31 samples, 0.13%)</title><rect x="35.3811%" y="244" width="0.1348%" height="15" fill="rgb(240,68,47)" fg:x="8138" fg:w="31"/><text x="35.6311%" y="254.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (311 samples, 1.35%)</title><rect x="35.6724%" y="244" width="1.3521%" height="15" fill="rgb(210,16,53)" fg:x="8205" fg:w="311"/><text x="35.9224%" y="254.50"></text></g><g><title>point_on_surface (shapely/constructive.py:581) (305 samples, 1.33%)</title><rect x="35.6984%" y="260" width="1.3260%" height="15" fill="rgb(235,124,12)" fg:x="8211" fg:w="305"/><text x="35.9484%" y="270.50"></text></g><g><title>_split_polygon_with_line (shapely/ops.py:380) (1,731 samples, 7.53%)</title><rect x="29.5422%" y="196" width="7.5258%" height="15" fill="rgb(224,169,11)" fg:x="6795" fg:w="1731"/><text x="29.7922%" y="206.50">_split_pol..</text></g><g><title>&lt;listcomp&gt; (shapely/ops.py:381) (1,098 samples, 4.77%)</title><rect x="32.2942%" y="212" width="4.7737%" height="15" fill="rgb(250,166,2)" fg:x="7428" fg:w="1098"/><text x="32.5442%" y="222.50">&lt;listc..</text></g><g><title>representative_point (shapely/geometry/base.py:385) (409 samples, 1.78%)</title><rect x="35.2898%" y="228" width="1.7782%" height="15" fill="rgb(242,216,29)" fg:x="8117" fg:w="409"/><text x="35.5398%" y="238.50">r..</text></g><g><title>wrapped (shapely/decorators.py:77) (141 samples, 0.61%)</title><rect x="37.6071%" y="244" width="0.6130%" height="15" fill="rgb(230,116,27)" fg:x="8650" fg:w="141"/><text x="37.8571%" y="254.50"></text></g><g><title>get_num_geometries (shapely/_geometry.py:679) (139 samples, 0.60%)</title><rect x="37.6158%" y="260" width="0.6043%" height="15" fill="rgb(228,99,48)" fg:x="8652" fg:w="139"/><text x="37.8658%" y="270.50"></text></g><g><title>__len__ (shapely/geometry/base.py:991) (213 samples, 0.93%)</title><rect x="37.3332%" y="228" width="0.9260%" height="15" fill="rgb(253,11,6)" fg:x="8587" fg:w="213"/><text x="37.5832%" y="238.50"></text></g><g><title>polygonize (shapely/ops.py:59) (244 samples, 1.06%)</title><rect x="37.2766%" y="212" width="1.0608%" height="15" fill="rgb(247,143,39)" fg:x="8574" fg:w="244"/><text x="37.5266%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (129 samples, 0.56%)</title><rect x="38.8070%" y="276" width="0.5608%" height="15" fill="rgb(236,97,10)" fg:x="8926" fg:w="129"/><text x="39.0570%" y="286.50"></text></g><g><title>get_num_geometries (shapely/_geometry.py:679) (129 samples, 0.56%)</title><rect x="38.8070%" y="292" width="0.5608%" height="15" fill="rgb(233,208,19)" fg:x="8926" fg:w="129"/><text x="39.0570%" y="302.50"></text></g><g><title>__iter__ (shapely/geometry/base.py:987) (191 samples, 0.83%)</title><rect x="38.5722%" y="244" width="0.8304%" height="15" fill="rgb(216,164,2)" fg:x="8872" fg:w="191"/><text x="38.8222%" y="254.50"></text></g><g><title>__len__ (shapely/geometry/base.py:991) (171 samples, 0.74%)</title><rect x="38.6592%" y="260" width="0.7434%" height="15" fill="rgb(220,129,5)" fg:x="8892" fg:w="171"/><text x="38.9092%" y="270.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (63 samples, 0.27%)</title><rect x="39.5722%" y="276" width="0.2739%" height="15" fill="rgb(242,17,10)" fg:x="9102" fg:w="63"/><text x="39.8222%" y="286.50"></text></g><g><title>&lt;listcomp&gt; (shapely/decorators.py:65) (29 samples, 0.13%)</title><rect x="39.7200%" y="292" width="0.1261%" height="15" fill="rgb(242,107,0)" fg:x="9136" fg:w="29"/><text x="39.9700%" y="302.50"></text></g><g><title>wrapped (shapely/decorators.py:66) (31 samples, 0.13%)</title><rect x="39.8896%" y="276" width="0.1348%" height="15" fill="rgb(251,28,31)" fg:x="9175" fg:w="31"/><text x="40.1396%" y="286.50"></text></g><g><title>wrapped (shapely/decorators.py:73) (38 samples, 0.17%)</title><rect x="40.0678%" y="276" width="0.1652%" height="15" fill="rgb(233,223,10)" fg:x="9216" fg:w="38"/><text x="40.3178%" y="286.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (820 samples, 3.57%)</title><rect x="40.2461%" y="276" width="3.5651%" height="15" fill="rgb(215,21,27)" fg:x="9257" fg:w="820"/><text x="40.4961%" y="286.50">wrap..</text></g><g><title>get_geometry (shapely/_geometry.py:542) (801 samples, 3.48%)</title><rect x="40.3287%" y="292" width="3.4825%" height="15" fill="rgb(232,23,21)" fg:x="9276" fg:w="801"/><text x="40.5787%" y="302.50">get..</text></g><g><title>__iter__ (shapely/geometry/base.py:988) (1,061 samples, 4.61%)</title><rect x="39.4026%" y="244" width="4.6128%" height="15" fill="rgb(244,5,23)" fg:x="9063" fg:w="1061"/><text x="39.6526%" y="254.50">__ite..</text></g><g><title>_get_geom_item (shapely/geometry/base.py:984) (1,050 samples, 4.57%)</title><rect x="39.4505%" y="260" width="4.5650%" height="15" fill="rgb(226,81,46)" fg:x="9074" fg:w="1050"/><text x="39.7005%" y="270.50">_get_..</text></g><g><title>wrapped (shapely/decorators.py:79) (47 samples, 0.20%)</title><rect x="43.8111%" y="276" width="0.2043%" height="15" fill="rgb(247,70,30)" fg:x="10077" fg:w="47"/><text x="44.0611%" y="286.50"></text></g><g><title>polygonize (shapely/ops.py:65) (1,306 samples, 5.68%)</title><rect x="38.3809%" y="212" width="5.6780%" height="15" fill="rgb(212,68,19)" fg:x="8828" fg:w="1306"/><text x="38.6309%" y="222.50">polygon..</text></g><g><title>&lt;listcomp&gt; (shapely/ops.py:65) (1,287 samples, 5.60%)</title><rect x="38.4635%" y="228" width="5.5954%" height="15" fill="rgb(240,187,13)" fg:x="8847" fg:w="1287"/><text x="38.7135%" y="238.50">&lt;listco..</text></g><g><title>polygonize (shapely/ops.py:66) (993 samples, 4.32%)</title><rect x="44.0590%" y="212" width="4.3172%" height="15" fill="rgb(223,113,26)" fg:x="10134" fg:w="993"/><text x="44.3090%" y="222.50">polyg..</text></g><g><title>polygonize (shapely/constructive.py:667) (989 samples, 4.30%)</title><rect x="44.0763%" y="228" width="4.2998%" height="15" fill="rgb(206,192,2)" fg:x="10138" fg:w="989"/><text x="44.3263%" y="238.50">polyg..</text></g><g><title>evaluate_cut_sequence (g8_player.py:205) (7,231 samples, 31.44%)</title><rect x="17.0340%" y="164" width="31.4378%" height="15" fill="rgb(241,108,4)" fg:x="3918" fg:w="7231"/><text x="17.2840%" y="174.50">evaluate_cut_sequence (g8_player.py:205)</text></g><g><title>split (shapely/ops.py:544) (6,400 samples, 27.82%)</title><rect x="20.6469%" y="180" width="27.8249%" height="15" fill="rgb(247,173,49)" fg:x="4749" fg:w="6400"/><text x="20.8969%" y="190.50">split (shapely/ops.py:544)</text></g><g><title>_split_polygon_with_line (shapely/ops.py:381) (2,623 samples, 11.40%)</title><rect x="37.0680%" y="196" width="11.4039%" height="15" fill="rgb(224,114,35)" fg:x="8526" fg:w="2623"/><text x="37.3180%" y="206.50">_split_polygon_wi..</text></g><g><title>wrapped (shapely/decorators.py:77) (132 samples, 0.57%)</title><rect x="48.9153%" y="212" width="0.5739%" height="15" fill="rgb(245,159,27)" fg:x="11251" fg:w="132"/><text x="49.1653%" y="222.50"></text></g><g><title>get_num_geometries (shapely/_geometry.py:679) (127 samples, 0.55%)</title><rect x="48.9370%" y="228" width="0.5521%" height="15" fill="rgb(245,172,44)" fg:x="11256" fg:w="127"/><text x="49.1870%" y="238.50"></text></g><g><title>__iter__ (shapely/geometry/base.py:987) (189 samples, 0.82%)</title><rect x="48.6979%" y="180" width="0.8217%" height="15" fill="rgb(236,23,11)" fg:x="11201" fg:w="189"/><text x="48.9479%" y="190.50"></text></g><g><title>__len__ (shapely/geometry/base.py:991) (176 samples, 0.77%)</title><rect x="48.7544%" y="196" width="0.7652%" height="15" fill="rgb(205,117,38)" fg:x="11214" fg:w="176"/><text x="49.0044%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (30 samples, 0.13%)</title><rect x="49.5805%" y="212" width="0.1304%" height="15" fill="rgb(237,72,25)" fg:x="11404" fg:w="30"/><text x="49.8305%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (261 samples, 1.13%)</title><rect x="49.8152%" y="212" width="1.1347%" height="15" fill="rgb(244,70,9)" fg:x="11458" fg:w="261"/><text x="50.0652%" y="222.50"></text></g><g><title>get_geometry (shapely/_geometry.py:542) (253 samples, 1.10%)</title><rect x="49.8500%" y="228" width="1.1000%" height="15" fill="rgb(217,125,39)" fg:x="11466" fg:w="253"/><text x="50.1000%" y="238.50"></text></g><g><title>__iter__ (shapely/geometry/base.py:988) (345 samples, 1.50%)</title><rect x="49.5196%" y="180" width="1.4999%" height="15" fill="rgb(235,36,10)" fg:x="11390" fg:w="345"/><text x="49.7696%" y="190.50"></text></g><g><title>_get_geom_item (shapely/geometry/base.py:984) (341 samples, 1.48%)</title><rect x="49.5370%" y="196" width="1.4825%" height="15" fill="rgb(251,123,47)" fg:x="11394" fg:w="341"/><text x="49.7870%" y="206.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (153 samples, 0.67%)</title><rect x="51.1891%" y="196" width="0.6652%" height="15" fill="rgb(221,13,13)" fg:x="11774" fg:w="153"/><text x="51.4391%" y="206.50"></text></g><g><title>get_num_geometries (shapely/_geometry.py:679) (152 samples, 0.66%)</title><rect x="51.1934%" y="212" width="0.6608%" height="15" fill="rgb(238,131,9)" fg:x="11775" fg:w="152"/><text x="51.4434%" y="222.50"></text></g><g><title>__len__ (shapely/geometry/base.py:991) (198 samples, 0.86%)</title><rect x="51.0195%" y="180" width="0.8608%" height="15" fill="rgb(211,50,8)" fg:x="11735" fg:w="198"/><text x="51.2695%" y="190.50"></text></g><g><title>evaluate_cut_sequence (g8_player.py:206) (802 samples, 3.49%)</title><rect x="48.4718%" y="164" width="3.4868%" height="15" fill="rgb(245,182,24)" fg:x="11149" fg:w="802"/><text x="48.7218%" y="174.50">eva..</text></g><g><title>evaluate_cut_sequence (g8_player.py:211) (55 samples, 0.24%)</title><rect x="52.0151%" y="164" width="0.2391%" height="15" fill="rgb(242,14,37)" fg:x="11964" fg:w="55"/><text x="52.2651%" y="174.50"></text></g><g><title>uuid4 (uuid.py:723) (53 samples, 0.23%)</title><rect x="52.0238%" y="180" width="0.2304%" height="15" fill="rgb(246,228,12)" fg:x="11966" fg:w="53"/><text x="52.2738%" y="190.50"></text></g><g><title>full (numpy/_core/numeric.py:365) (64 samples, 0.28%)</title><rect x="52.3412%" y="196" width="0.2782%" height="15" fill="rgb(213,55,15)" fg:x="12039" fg:w="64"/><text x="52.5912%" y="206.50"></text></g><g><title>calculate_penalties (g8_player.py:306) (115 samples, 0.50%)</title><rect x="52.3238%" y="180" width="0.5000%" height="15" fill="rgb(209,9,3)" fg:x="12035" fg:w="115"/><text x="52.5738%" y="190.50"></text></g><g><title>full (numpy/_core/numeric.py:366) (47 samples, 0.20%)</title><rect x="52.6195%" y="196" width="0.2043%" height="15" fill="rgb(230,59,30)" fg:x="12103" fg:w="47"/><text x="52.8695%" y="206.50"></text></g><g><title>fits_on_plate (g8_player.py:290) (462 samples, 2.01%)</title><rect x="52.9760%" y="196" width="2.0086%" height="15" fill="rgb(209,121,21)" fg:x="12185" fg:w="462"/><text x="53.2260%" y="206.50">f..</text></g><g><title>get_coordinates (shapely/coordinates.py:136) (267 samples, 1.16%)</title><rect x="56.3497%" y="228" width="1.1608%" height="15" fill="rgb(220,109,13)" fg:x="12961" fg:w="267"/><text x="56.5997%" y="238.50"></text></g><g><title>get_coordinates (shapely/coordinates.py:137) (399 samples, 1.73%)</title><rect x="57.5105%" y="228" width="1.7347%" height="15" fill="rgb(232,18,1)" fg:x="13228" fg:w="399"/><text x="57.7605%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (70 samples, 0.30%)</title><rect x="59.4931%" y="244" width="0.3043%" height="15" fill="rgb(215,41,42)" fg:x="13684" fg:w="70"/><text x="59.7431%" y="254.50"></text></g><g><title>&lt;listcomp&gt; (shapely/decorators.py:65) (34 samples, 0.15%)</title><rect x="59.6496%" y="260" width="0.1478%" height="15" fill="rgb(224,123,36)" fg:x="13720" fg:w="34"/><text x="59.8996%" y="270.50"></text></g><g><title>wrapped (shapely/decorators.py:66) (42 samples, 0.18%)</title><rect x="59.8409%" y="244" width="0.1826%" height="15" fill="rgb(240,125,3)" fg:x="13764" fg:w="42"/><text x="60.0909%" y="254.50"></text></g><g><title>wrapped (shapely/decorators.py:73) (48 samples, 0.21%)</title><rect x="60.0930%" y="244" width="0.2087%" height="15" fill="rgb(205,98,50)" fg:x="13822" fg:w="48"/><text x="60.3430%" y="254.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (792 samples, 3.44%)</title><rect x="60.3365%" y="244" width="3.4433%" height="15" fill="rgb(205,185,37)" fg:x="13878" fg:w="792"/><text x="60.5865%" y="254.50">wra..</text></g><g><title>has_z (shapely/predicates.py:68) (775 samples, 3.37%)</title><rect x="60.4104%" y="260" width="3.3694%" height="15" fill="rgb(238,207,15)" fg:x="13895" fg:w="775"/><text x="60.6604%" y="270.50">has..</text></g><g><title>coords (shapely/geometry/base.py:223) (1,787 samples, 7.77%)</title><rect x="56.1932%" y="212" width="7.7692%" height="15" fill="rgb(213,199,42)" fg:x="12925" fg:w="1787"/><text x="56.4432%" y="222.50">coords (sha..</text></g><g><title>has_z (shapely/geometry/base.py:624) (1,076 samples, 4.68%)</title><rect x="59.2844%" y="228" width="4.6781%" height="15" fill="rgb(235,201,11)" fg:x="13636" fg:w="1076"/><text x="59.5344%" y="238.50">has_z..</text></g><g><title>wrapped (shapely/decorators.py:79) (42 samples, 0.18%)</title><rect x="63.7798%" y="244" width="0.1826%" height="15" fill="rgb(207,46,11)" fg:x="14670" fg:w="42"/><text x="64.0298%" y="254.50"></text></g><g><title>coords (shapely/geometry/base.py:224) (53 samples, 0.23%)</title><rect x="63.9624%" y="212" width="0.2304%" height="15" fill="rgb(241,35,35)" fg:x="14712" fg:w="53"/><text x="64.2124%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (56 samples, 0.24%)</title><rect x="64.4407%" y="228" width="0.2435%" height="15" fill="rgb(243,32,47)" fg:x="14822" fg:w="56"/><text x="64.6907%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:66) (51 samples, 0.22%)</title><rect x="64.7102%" y="228" width="0.2217%" height="15" fill="rgb(247,202,23)" fg:x="14884" fg:w="51"/><text x="64.9602%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:73) (44 samples, 0.19%)</title><rect x="65.0233%" y="228" width="0.1913%" height="15" fill="rgb(219,102,11)" fg:x="14956" fg:w="44"/><text x="65.2733%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (934 samples, 4.06%)</title><rect x="65.2493%" y="228" width="4.0607%" height="15" fill="rgb(243,110,44)" fg:x="15008" fg:w="934"/><text x="65.4993%" y="238.50">wrap..</text></g><g><title>get_exterior_ring (shapely/_geometry.py:425) (908 samples, 3.95%)</title><rect x="65.3624%" y="244" width="3.9477%" height="15" fill="rgb(222,74,54)" fg:x="15034" fg:w="908"/><text x="65.6124%" y="254.50">get_..</text></g><g><title>exterior (shapely/geometry/polygon.py:246) (1,212 samples, 5.27%)</title><rect x="64.2276%" y="212" width="5.2693%" height="15" fill="rgb(216,99,12)" fg:x="14773" fg:w="1212"/><text x="64.4776%" y="222.50">exteri..</text></g><g><title>wrapped (shapely/decorators.py:79) (43 samples, 0.19%)</title><rect x="69.3100%" y="228" width="0.1869%" height="15" fill="rgb(226,22,26)" fg:x="15942" fg:w="43"/><text x="69.5600%" y="238.50"></text></g><g><title>xy (shapely/coords.py:60) (50 samples, 0.22%)</title><rect x="69.5274%" y="212" width="0.2174%" height="15" fill="rgb(217,163,10)" fg:x="15992" fg:w="50"/><text x="69.7774%" y="222.50"></text></g><g><title>__len__ (shapely/coords.py:24) (31 samples, 0.13%)</title><rect x="69.6100%" y="228" width="0.1348%" height="15" fill="rgb(213,25,53)" fg:x="16011" fg:w="31"/><text x="69.8600%" y="238.50"></text></g><g><title>xy (shapely/coords.py:61) (64 samples, 0.28%)</title><rect x="69.7448%" y="212" width="0.2782%" height="15" fill="rgb(252,105,26)" fg:x="16042" fg:w="64"/><text x="69.9948%" y="222.50"></text></g><g><title>xy (shapely/coords.py:63) (61 samples, 0.27%)</title><rect x="70.1230%" y="212" width="0.2652%" height="15" fill="rgb(220,39,43)" fg:x="16129" fg:w="61"/><text x="70.3730%" y="222.50"></text></g><g><title>xy (shapely/coords.py:64) (262 samples, 1.14%)</title><rect x="70.3882%" y="212" width="1.1391%" height="15" fill="rgb(229,68,48)" fg:x="16190" fg:w="262"/><text x="70.6382%" y="222.50"></text></g><g><title>xy (shapely/coords.py:65) (135 samples, 0.59%)</title><rect x="71.5273%" y="212" width="0.5869%" height="15" fill="rgb(252,8,32)" fg:x="16452" fg:w="135"/><text x="71.7773%" y="222.50"></text></g><g><title>xy (shapely/coords.py:66) (115 samples, 0.50%)</title><rect x="72.1143%" y="212" width="0.5000%" height="15" fill="rgb(223,20,43)" fg:x="16587" fg:w="115"/><text x="72.3643%" y="222.50"></text></g><g><title>fits_on_plate (g8_player.py:291) (4,059 samples, 17.65%)</title><rect x="54.9846%" y="196" width="17.6471%" height="15" fill="rgb(229,81,49)" fg:x="12647" fg:w="4059"/><text x="55.2346%" y="206.50">fits_on_plate (g8_player.py..</text></g><g><title>fits_on_plate (g8_player.py:295) (496 samples, 2.16%)</title><rect x="72.6316%" y="196" width="2.1564%" height="15" fill="rgb(236,28,36)" fg:x="16706" fg:w="496"/><text x="72.8816%" y="206.50">f..</text></g><g><title>calculate_penalties (g8_player.py:310) (5,058 samples, 21.99%)</title><rect x="52.8586%" y="180" width="21.9903%" height="15" fill="rgb(249,185,26)" fg:x="12158" fg:w="5058"/><text x="53.1086%" y="190.50">calculate_penalties (g8_player.py:3..</text></g><g><title>wrapped (shapely/decorators.py:64) (63 samples, 0.27%)</title><rect x="75.1619%" y="212" width="0.2739%" height="15" fill="rgb(249,174,33)" fg:x="17288" fg:w="63"/><text x="75.4119%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:66) (35 samples, 0.15%)</title><rect x="75.4706%" y="212" width="0.1522%" height="15" fill="rgb(233,201,37)" fg:x="17359" fg:w="35"/><text x="75.7206%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:73) (43 samples, 0.19%)</title><rect x="75.7098%" y="212" width="0.1869%" height="15" fill="rgb(221,78,26)" fg:x="17414" fg:w="43"/><text x="75.9598%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (1,085 samples, 4.72%)</title><rect x="75.9315%" y="212" width="4.7172%" height="15" fill="rgb(250,127,30)" fg:x="17465" fg:w="1085"/><text x="76.1815%" y="222.50">wrapp..</text></g><g><title>area (shapely/measurement.py:44) (1,065 samples, 4.63%)</title><rect x="76.0184%" y="228" width="4.6302%" height="15" fill="rgb(230,49,44)" fg:x="17485" fg:w="1065"/><text x="76.2684%" y="238.50">area ..</text></g><g><title>calculate_penalties (g8_player.py:313) (1,379 samples, 6.00%)</title><rect x="74.8533%" y="180" width="5.9954%" height="15" fill="rgb(229,67,23)" fg:x="17217" fg:w="1379"/><text x="75.1033%" y="190.50">calculat..</text></g><g><title>area (shapely/geometry/base.py:330) (1,354 samples, 5.89%)</title><rect x="74.9620%" y="196" width="5.8867%" height="15" fill="rgb(249,83,47)" fg:x="17242" fg:w="1354"/><text x="75.2120%" y="206.50">area (s..</text></g><g><title>wrapped (shapely/decorators.py:79) (46 samples, 0.20%)</title><rect x="80.6487%" y="212" width="0.2000%" height="15" fill="rgb(215,43,3)" fg:x="18550" fg:w="46"/><text x="80.8987%" y="222.50"></text></g><g><title>calculate_penalties (g8_player.py:314) (99 samples, 0.43%)</title><rect x="80.8487%" y="180" width="0.4304%" height="15" fill="rgb(238,154,13)" fg:x="18596" fg:w="99"/><text x="81.0987%" y="190.50"></text></g><g><title>calculate_penalties (g8_player.py:316) (351 samples, 1.53%)</title><rect x="81.2791%" y="180" width="1.5260%" height="15" fill="rgb(219,56,2)" fg:x="18695" fg:w="351"/><text x="81.5291%" y="190.50"></text></g><g><title>calculate_penalties (g8_player.py:317) (111 samples, 0.48%)</title><rect x="82.8051%" y="180" width="0.4826%" height="15" fill="rgb(233,0,4)" fg:x="19046" fg:w="111"/><text x="83.0551%" y="190.50"></text></g><g><title>calculate_penalties (g8_player.py:318) (35 samples, 0.15%)</title><rect x="83.2877%" y="180" width="0.1522%" height="15" fill="rgb(235,30,7)" fg:x="19157" fg:w="35"/><text x="83.5377%" y="190.50"></text></g><g><title>calculate_penalties (g8_player.py:320) (416 samples, 1.81%)</title><rect x="83.4399%" y="180" width="1.8086%" height="15" fill="rgb(250,79,13)" fg:x="19192" fg:w="416"/><text x="83.6899%" y="190.50">c..</text></g><g><title>calculate_penalties (g8_player.py:323) (424 samples, 1.84%)</title><rect x="85.2485%" y="180" width="1.8434%" height="15" fill="rgb(211,146,34)" fg:x="19608" fg:w="424"/><text x="85.4985%" y="190.50">c..</text></g><g><title>calculate_penalties (g8_player.py:330) (41 samples, 0.18%)</title><rect x="87.1180%" y="180" width="0.1783%" height="15" fill="rgb(228,22,38)" fg:x="20038" fg:w="41"/><text x="87.3680%" y="190.50"></text></g><g><title>calculate_penalties (g8_player.py:331) (24 samples, 0.10%)</title><rect x="87.2962%" y="180" width="0.1043%" height="15" fill="rgb(235,168,5)" fg:x="20079" fg:w="24"/><text x="87.5462%" y="190.50"></text></g><g><title>fits_on_plate (g8_player.py:290) (187 samples, 0.81%)</title><rect x="87.5658%" y="196" width="0.8130%" height="15" fill="rgb(221,155,16)" fg:x="20141" fg:w="187"/><text x="87.8158%" y="206.50"></text></g><g><title>get_coordinates (shapely/coordinates.py:136) (141 samples, 0.61%)</title><rect x="88.8700%" y="228" width="0.6130%" height="15" fill="rgb(215,215,53)" fg:x="20441" fg:w="141"/><text x="89.1200%" y="238.50"></text></g><g><title>get_coordinates (shapely/coordinates.py:137) (157 samples, 0.68%)</title><rect x="89.4831%" y="228" width="0.6826%" height="15" fill="rgb(223,4,10)" fg:x="20582" fg:w="157"/><text x="89.7331%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:64) (24 samples, 0.10%)</title><rect x="90.2743%" y="244" width="0.1043%" height="15" fill="rgb(234,103,6)" fg:x="20764" fg:w="24"/><text x="90.5243%" y="254.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (324 samples, 1.41%)</title><rect x="90.5830%" y="244" width="1.4086%" height="15" fill="rgb(227,97,0)" fg:x="20835" fg:w="324"/><text x="90.8330%" y="254.50"></text></g><g><title>has_z (shapely/predicates.py:68) (316 samples, 1.37%)</title><rect x="90.6178%" y="260" width="1.3739%" height="15" fill="rgb(234,150,53)" fg:x="20843" fg:w="316"/><text x="90.8678%" y="270.50"></text></g><g><title>coords (shapely/geometry/base.py:223) (763 samples, 3.32%)</title><rect x="88.7657%" y="212" width="3.3172%" height="15" fill="rgb(228,201,54)" fg:x="20417" fg:w="763"/><text x="89.0157%" y="222.50">coo..</text></g><g><title>has_z (shapely/geometry/base.py:624) (435 samples, 1.89%)</title><rect x="90.1917%" y="228" width="1.8912%" height="15" fill="rgb(222,22,37)" fg:x="20745" fg:w="435"/><text x="90.4417%" y="238.50">h..</text></g><g><title>wrapped (shapely/decorators.py:66) (25 samples, 0.11%)</title><rect x="92.3742%" y="228" width="0.1087%" height="15" fill="rgb(237,53,32)" fg:x="21247" fg:w="25"/><text x="92.6242%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:73) (24 samples, 0.10%)</title><rect x="92.5134%" y="228" width="0.1043%" height="15" fill="rgb(233,25,53)" fg:x="21279" fg:w="24"/><text x="92.7634%" y="238.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (367 samples, 1.60%)</title><rect x="92.6568%" y="228" width="1.5956%" height="15" fill="rgb(210,40,34)" fg:x="21312" fg:w="367"/><text x="92.9068%" y="238.50"></text></g><g><title>get_exterior_ring (shapely/_geometry.py:425) (360 samples, 1.57%)</title><rect x="92.6873%" y="244" width="1.5651%" height="15" fill="rgb(241,220,44)" fg:x="21319" fg:w="360"/><text x="92.9373%" y="254.50"></text></g><g><title>exterior (shapely/geometry/polygon.py:246) (489 samples, 2.13%)</title><rect x="92.1916%" y="212" width="2.1260%" height="15" fill="rgb(235,28,35)" fg:x="21205" fg:w="489"/><text x="92.4416%" y="222.50">e..</text></g><g><title>xy (shapely/coords.py:63) (26 samples, 0.11%)</title><rect x="94.5307%" y="212" width="0.1130%" height="15" fill="rgb(210,56,17)" fg:x="21743" fg:w="26"/><text x="94.7807%" y="222.50"></text></g><g><title>xy (shapely/coords.py:64) (116 samples, 0.50%)</title><rect x="94.6437%" y="212" width="0.5043%" height="15" fill="rgb(224,130,29)" fg:x="21769" fg:w="116"/><text x="94.8937%" y="222.50"></text></g><g><title>xy (shapely/coords.py:65) (53 samples, 0.23%)</title><rect x="95.1480%" y="212" width="0.2304%" height="15" fill="rgb(235,212,8)" fg:x="21885" fg:w="53"/><text x="95.3980%" y="222.50"></text></g><g><title>xy (shapely/coords.py:66) (44 samples, 0.19%)</title><rect x="95.3785%" y="212" width="0.1913%" height="15" fill="rgb(223,33,50)" fg:x="21938" fg:w="44"/><text x="95.6285%" y="222.50"></text></g><g><title>fits_on_plate (g8_player.py:291) (1,656 samples, 7.20%)</title><rect x="88.3788%" y="196" width="7.1997%" height="15" fill="rgb(219,149,13)" fg:x="20328" fg:w="1656"/><text x="88.6288%" y="206.50">fits_on_pl..</text></g><g><title>fits_on_plate (g8_player.py:295) (223 samples, 0.97%)</title><rect x="95.5785%" y="196" width="0.9695%" height="15" fill="rgb(250,156,29)" fg:x="21984" fg:w="223"/><text x="95.8285%" y="206.50"></text></g><g><title>calculate_penalties (g8_player.py:336) (2,106 samples, 9.16%)</title><rect x="87.4397%" y="180" width="9.1561%" height="15" fill="rgb(216,193,19)" fg:x="20112" fg:w="2106"/><text x="87.6897%" y="190.50">calculate_pen..</text></g><g><title>wrapped (shapely/decorators.py:64) (26 samples, 0.11%)</title><rect x="96.8001%" y="212" width="0.1130%" height="15" fill="rgb(216,135,14)" fg:x="22265" fg:w="26"/><text x="97.0501%" y="222.50"></text></g><g><title>wrapped (shapely/decorators.py:77) (474 samples, 2.06%)</title><rect x="97.1045%" y="212" width="2.0608%" height="15" fill="rgb(241,47,5)" fg:x="22335" fg:w="474"/><text x="97.3545%" y="222.50">w..</text></g><g><title>area (shapely/measurement.py:44) (461 samples, 2.00%)</title><rect x="97.1610%" y="228" width="2.0043%" height="15" fill="rgb(233,42,35)" fg:x="22348" fg:w="461"/><text x="97.4110%" y="238.50">a..</text></g><g><title>calculate_penalties (g8_player.py:341) (603 samples, 2.62%)</title><rect x="96.6175%" y="180" width="2.6216%" height="15" fill="rgb(231,13,6)" fg:x="22223" fg:w="603"/><text x="96.8675%" y="190.50">ca..</text></g><g><title>area (shapely/geometry/base.py:330) (577 samples, 2.51%)</title><rect x="96.7306%" y="196" width="2.5086%" height="15" fill="rgb(207,181,40)" fg:x="22249" fg:w="577"/><text x="96.9806%" y="206.50">ar..</text></g><g><title>evaluate_cut_sequence (g8_player.py:215) (10,815 samples, 47.02%)</title><rect x="52.2716%" y="164" width="47.0197%" height="15" fill="rgb(254,173,49)" fg:x="12023" fg:w="10815"/><text x="52.5216%" y="174.50">evaluate_cut_sequence (g8_player.py:215)</text></g><g><title>solve (g8_player.py:144) (21,949 samples, 95.43%)</title><rect x="4.5476%" y="148" width="95.4263%" height="15" fill="rgb(221,1,38)" fg:x="1046" fg:w="21949"/><text x="4.7976%" y="158.50">solve (g8_player.py:144)</text></g><g><title>evaluate_cut_sequence (g8_player.py:216) (157 samples, 0.68%)</title><rect x="99.2913%" y="164" width="0.6826%" height="15" fill="rgb(206,124,46)" fg:x="22838" fg:w="157"/><text x="99.5413%" y="174.50"></text></g><g><title>calculate_cut_length (g8_player.py:254) (141 samples, 0.61%)</title><rect x="99.3609%" y="180" width="0.6130%" height="15" fill="rgb(249,21,11)" fg:x="22854" fg:w="141"/><text x="99.6109%" y="190.50"></text></g><g><title>all (23,001 samples, 100%)</title><rect x="0.0000%" y="52" width="100.0000%" height="15" fill="rgb(222,201,40)" fg:x="0" fg:w="23001"/><text x="0.2500%" y="62.50"></text></g><g><title>&lt;module&gt; (main.py:28) (23,001 samples, 100.00%)</title><rect x="0.0000%" y="68" width="100.0000%" height="15" fill="rgb(235,61,29)" fg:x="0" fg:w="23001"/><text x="0.2500%" y="78.50">&lt;module&gt; (main.py:28)</text></g><g><title>__init__ (piece_of_cake_game.py:114) (23,001 samples, 100.00%)</title><rect x="0.0000%" y="84" width="100.0000%" height="15" fill="rgb(219,207,3)" fg:x="0" fg:w="23001"/><text x="0.2500%" y="94.50">__init__ (piece_of_cake_game.py:114)</text></g><g><title>initialize (piece_of_cake_game.py:211) (23,001 samples, 100.00%)</title><rect x="0.0000%" y="100" width="100.0000%" height="15" fill="rgb(222,56,46)" fg:x="0" fg:w="23001"/><text x="0.2500%" y="110.50">initialize (piece_of_cake_game.py:211)</text></g><g><title>play_game (piece_of_cake_game.py:315) (23,001 samples, 100.00%)</title><rect x="0.0000%" y="116" width="100.0000%" height="15" fill="rgb(239,76,54)" fg:x="0" fg:w="23001"/><text x="0.2500%" y="126.50">play_game (piece_of_cake_game.py:315)</text></g><g><title>move (g8_player.py:106) (23,001 samples, 100.00%)</title><rect x="0.0000%" y="132" width="100.0000%" height="15" fill="rgb(231,124,27)" fg:x="0" fg:w="23001"/><text x="0.2500%" y="142.50">move (g8_player.py:106)</text></g></svg></svg>
